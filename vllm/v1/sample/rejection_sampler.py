@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Sequence
 from dataclasses import replace
 
@@ -24,6 +25,62 @@ GREEDY_TEMPERATURE: tl.constexpr = 0
 # Maximum number of speculative draft tokens allowed per request in a single
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 128
+
+_spec_rejection_log_counter = 0
+
+
+def _maybe_log_spec_rejection_sampling_mode(
+    sampling_metadata: SamplingMetadata,
+    num_draft_tokens: list[int],
+) -> None:
+    """Log greedy/random/mixed rejection path (rate-limited)."""
+    global _spec_rejection_log_counter
+    if not num_draft_tokens or sum(num_draft_tokens) == 0:
+        return
+
+    _spec_rejection_log_counter += 1
+    interval = max(1, int(os.environ.get("VLLM_SPEC_REJECTION_LOG_INTERVAL", "100")))
+    if (
+        _spec_rejection_log_counter != 1
+        and _spec_rejection_log_counter % interval != 0
+    ):
+        return
+
+    if sampling_metadata.all_greedy:
+        mode = "greedy"
+    elif sampling_metadata.all_random:
+        mode = "random"
+    else:
+        mode = "mixed"
+
+    temp_summary = ""
+    temps = sampling_metadata.temperature
+    if temps is not None and temps.numel() > 0:
+        temp_cpu = temps.detach().cpu()
+        temp_summary = (
+            f", temperature(min={temp_cpu.min().item():.4f}, "
+            f"max={temp_cpu.max().item():.4f})"
+        )
+
+    uniform_override = os.environ.get("VLLM_SPEC_UNIFORM_OVERRIDE")
+    override_summary = (
+        f", uniform_override={uniform_override}"
+        if uniform_override is not None
+        else ""
+    )
+
+    logger.info(
+        "Spec rejection sampling mode=%s (all_greedy=%s, all_random=%s, "
+        "batch_size=%d, num_draft_tokens=%d, call_count=%d%s%s)",
+        mode,
+        sampling_metadata.all_greedy,
+        sampling_metadata.all_random,
+        len(num_draft_tokens),
+        sum(num_draft_tokens),
+        _spec_rejection_log_counter,
+        temp_summary,
+        override_summary,
+    )
 
 
 class RejectionSampler(nn.Module):
@@ -356,6 +413,11 @@ def rejection_sample(
     assert bonus_token_ids.is_contiguous()
     assert target_probs.shape == (num_tokens, vocab_size)
 
+    if num_tokens > 0:
+        _maybe_log_spec_rejection_sampling_mode(
+            sampling_metadata, num_draft_tokens
+        )
+
     # Create output buffer.
     output_token_ids = torch.full(
         (batch_size, max_spec_len + 1),
@@ -573,6 +635,19 @@ def generate_uniform_probs(
         if generator is not None:
             uniform_probs[start_idx:end_idx].uniform_(generator=generator)
         start_idx = end_idx
+
+    # Local functional testing only: fix U for all draft positions.
+    # Example: export VLLM_SPEC_UNIFORM_OVERRIDE=0
+    uniform_override = os.environ.get("VLLM_SPEC_UNIFORM_OVERRIDE")
+    if uniform_override is not None:
+        override_value = float(uniform_override)
+        uniform_probs.fill_(override_value)
+        logger.info(
+            "Spec rejection: applied VLLM_SPEC_UNIFORM_OVERRIDE=%s "
+            "(num_tokens=%d)",
+            override_value,
+            num_tokens,
+        )
     return uniform_probs
 
 

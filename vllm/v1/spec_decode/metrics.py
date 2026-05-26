@@ -47,9 +47,10 @@ class SpecDecodingStats:
 class SpecDecodingLogging:
     """Aggregate and log spec decoding metrics.
 
-    LoggingStatLogger aggregates per-iteration metrics over a set
-    time interval using observe() and then logs them using log()
-    before resetting to zero.
+    LoggingStatLogger aggregates per-iteration metrics using observe() and
+    logs them via log() before resetting. Throughput uses the wall time from
+    the first to the last observe() in the window (active spec-decode time),
+    not the idle time since the previous log line.
     """
 
     def __init__(self):
@@ -60,9 +61,14 @@ class SpecDecodingLogging:
         self.num_draft_tokens: list[int] = []
         self.num_accepted_tokens: list[int] = []
         self.accepted_tokens_per_pos_lists: list[list[int]] = []
-        self.last_log_time = time.monotonic()
+        self.first_observe_time: float | None = None
+        self.last_observe_time: float | None = None
 
     def observe(self, spec_decoding_stats: SpecDecodingStats):
+        now = time.monotonic()
+        if self.first_observe_time is None:
+            self.first_observe_time = now
+        self.last_observe_time = now
         self.num_drafts.append(spec_decoding_stats.num_drafts)
         self.num_draft_tokens.append(spec_decoding_stats.num_draft_tokens)
         self.num_accepted_tokens.append(spec_decoding_stats.num_accepted_tokens)
@@ -70,16 +76,24 @@ class SpecDecodingLogging:
             spec_decoding_stats.num_accepted_tokens_per_pos
         )
 
+    def _active_elapsed_time(self) -> float:
+        if self.first_observe_time is None or self.last_observe_time is None:
+            return 0.0
+        return max(self.last_observe_time - self.first_observe_time, 0.0)
+
     def log(self, log_fn=logger.info):
         if not self.num_drafts:
             return
         num_drafts = np.sum(self.num_drafts)
         num_draft_tokens = np.sum(self.num_draft_tokens)
         num_accepted_tokens = np.sum(self.num_accepted_tokens)
-        draft_throughput = 0
-        accepted_throughput = 0
+        draft_throughput = 0.0
+        accepted_throughput = 0.0
 
-        elapsed_time = time.monotonic() - self.last_log_time
+        elapsed_time = self._active_elapsed_time()
+        # Avoid division by zero when all observes share the same timestamp.
+        if elapsed_time <= 0 and num_draft_tokens > 0:
+            elapsed_time = 1e-6
         if elapsed_time > 0:
             draft_throughput = num_draft_tokens / elapsed_time
             accepted_throughput = num_accepted_tokens / elapsed_time
@@ -102,6 +116,7 @@ class SpecDecodingLogging:
             "Mean acceptance length: %.2f, "
             "Accepted throughput: %.2f tokens/s, "
             "Drafted throughput: %.2f tokens/s, "
+            "Active time: %.2fs, "
             "Accepted: %d tokens, "
             "Drafted: %d tokens, "
             "Per-position acceptance rate: %s, "
@@ -109,6 +124,7 @@ class SpecDecodingLogging:
             mean_acceptance_length,
             accepted_throughput,
             draft_throughput,
+            elapsed_time,
             num_accepted_tokens,
             num_draft_tokens,
             rates_str,
