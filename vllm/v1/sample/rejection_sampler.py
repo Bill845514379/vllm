@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import random as py_random
 from collections.abc import Sequence
 from dataclasses import replace
 
@@ -29,6 +30,61 @@ MAX_SPEC_LEN = 128
 _spec_rejection_log_counter = 0
 
 
+def spec_rejection_test_override_active() -> bool:
+    """Whether local spec-rejection test overrides are enabled."""
+    return (
+        os.environ.get("VLLM_SPEC_UNIFORM_OVERRIDE") is not None
+        and os.environ.get("VLLM_SPEC_GREEDY_OVERRIDE_PROB") is not None
+    )
+
+
+def get_spec_rejection_greedy_override_prob() -> float | None:
+    """Greedy-path probability for test override; requires uniform override."""
+    if not spec_rejection_test_override_active():
+        return None
+    greedy_prob = float(os.environ["VLLM_SPEC_GREEDY_OVERRIDE_PROB"])
+    if not 0.0 <= greedy_prob <= 1.0:
+        raise ValueError(
+            "VLLM_SPEC_GREEDY_OVERRIDE_PROB must be in [0, 1], got "
+            f"{greedy_prob}"
+        )
+    return greedy_prob
+
+
+def build_spec_test_is_greedy_override(
+    batch_size: int,
+    device: torch.device,
+    generators: dict[int, torch.Generator] | None,
+) -> torch.Tensor | None:
+    """Per-request mask: True => greedy rejection, False => random rejection.
+
+    Only active when both VLLM_SPEC_UNIFORM_OVERRIDE and
+    VLLM_SPEC_GREEDY_OVERRIDE_PROB are set. Intended for dummy-model benches:
+    greedy almost never accepts a wrong draft; random with U=0 and no draft
+    probs accepts when target_prob > 0. With one draft per request, the
+    expected accept rate is approximately (1 - p).
+    """
+    greedy_prob = get_spec_rejection_greedy_override_prob()
+    if greedy_prob is None:
+        return None
+
+    if greedy_prob == 0.0:
+        return torch.zeros(batch_size, dtype=torch.bool, device=device)
+    if greedy_prob == 1.0:
+        return torch.ones(batch_size, dtype=torch.bool, device=device)
+
+    # Sample on CPU only: NPU rand / H2D during ACL graph replay can crash.
+    greedy_flags: list[bool] = []
+    for req_idx in range(batch_size):
+        generator = generators.get(req_idx) if generators else None
+        if generator is not None:
+            u = torch.rand((), generator=generator, device="cpu").item()
+        else:
+            u = py_random.random()
+        greedy_flags.append(u < greedy_prob)
+    return torch.tensor(greedy_flags, dtype=torch.bool, device=device)
+
+
 def _maybe_log_spec_rejection_sampling_mode(
     sampling_metadata: SamplingMetadata,
     num_draft_tokens: list[int],
@@ -46,7 +102,9 @@ def _maybe_log_spec_rejection_sampling_mode(
     ):
         return
 
-    if sampling_metadata.all_greedy:
+    if spec_rejection_test_override_active():
+        mode = "test_override"
+    elif sampling_metadata.all_greedy:
         mode = "greedy"
     elif sampling_metadata.all_random:
         mode = "random"
@@ -63,11 +121,12 @@ def _maybe_log_spec_rejection_sampling_mode(
         )
 
     uniform_override = os.environ.get("VLLM_SPEC_UNIFORM_OVERRIDE")
-    override_summary = (
-        f", uniform_override={uniform_override}"
-        if uniform_override is not None
-        else ""
-    )
+    greedy_override_prob = os.environ.get("VLLM_SPEC_GREEDY_OVERRIDE_PROB")
+    override_summary = ""
+    if uniform_override is not None:
+        override_summary += f", uniform_override={uniform_override}"
+    if greedy_override_prob is not None:
+        override_summary += f", greedy_override_prob={greedy_override_prob}"
 
     logger.info(
         "Spec rejection sampling mode=%s (all_greedy=%s, all_random=%s, "
@@ -426,11 +485,23 @@ def rejection_sample(
         device=device,
     )
 
-    if sampling_metadata.all_greedy:
+    test_override_active = spec_rejection_test_override_active()
+    is_greedy_override = build_spec_test_is_greedy_override(
+        batch_size,
+        device,
+        sampling_metadata.generators,
+    )
+    if is_greedy_override is not None:
+        is_greedy = is_greedy_override
+    elif sampling_metadata.all_greedy:
         is_greedy = None
     else:
         is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
-    if not sampling_metadata.all_random:
+    # Test override may mark a subset as greedy even when the batch is random.
+    run_greedy_rejection = (
+        not sampling_metadata.all_random or test_override_active
+    )
+    if run_greedy_rejection:
         # Rejection sampling for greedy sampling requests.
         target_argmax = target_probs.argmax(dim=-1)
         rejection_greedy_sample_kernel[(batch_size,)](
@@ -442,7 +513,7 @@ def rejection_sample(
             is_greedy,
             max_spec_len,
         )
-        if sampling_metadata.all_greedy:
+        if sampling_metadata.all_greedy and not test_override_active:
             return output_token_ids
 
     # Generate uniform probabilities for rejection sampling.
